@@ -38,5 +38,15 @@ Execute o comando:
   go run main.go -input <INPUT_DIR> -output <OUTPUT_DIR>
 ```
 
+### Docker
+
+```bash
+docker build -t video-converter .
+```
+
+```bash
+docker run --rm -v <INPUT_DIR>:/app/input -v <OUTPUT_DIR>:/app/output video-converter -input /app/input -output /app/output
+```
+
 - INPUT_DIR: Local onde os arquivos que precisam de conversão se encontram
 - OUTPUT_DIR: Local onde os arquivos convertidos serão criados
