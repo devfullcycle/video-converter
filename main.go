@@ -57,7 +57,7 @@ func main() {
 			defer func() { <-sem }() 
 
 			outputFile := filepath.Join(*outputDir, filepath.Base(inputFile))
-			outputFile = strings.Replace(outputFile, ".mp4", "_converted.mp4", 1)
+			// outputFile = strings.Replace(outputFile, ".mp4", "_converted.mp4", 1)
 
 			start := time.Now()
 			fmt.Printf("Iniciando conversão de %s em %s\n", inputFile, start.Format("15:04:05"))
