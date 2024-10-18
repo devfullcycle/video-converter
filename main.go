@@ -6,68 +6,76 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
-
-var (
-	inputDir   string
-	outputDir  string
-	presetFile string
-)
-
-func init() {
-	flag.StringVar(&inputDir, "input", "./input", "Diretório de entrada com arquivos de vídeo")
-	flag.StringVar(&outputDir, "output", "./output", "Diretório de saída para vídeos convertidos")
-	flag.StringVar(&presetFile, "preset", "", "Arquivo de preset JSON para HandBrakeCLI")
-}
-
-func convertVideo(inputFile, outputDir, presetFile string) {
-	outputFile := filepath.Join(outputDir, filepath.Base(inputFile))
-	outputFile = outputFile[:len(outputFile)-len(filepath.Ext(outputFile))] + "_converted.mp4"
-
-	handbrakeCmd := []string{
-		"HandBrakeCLI",
-		"-i", inputFile,
-		"-o", outputFile,
-		"--preset-import-file", presetFile,
-		"--encoder", "x264",
-		"--encoder-preset", "veryfast", // Ajuste o preset conforme necessário
-	}
-
-	cmd := exec.Command(handbrakeCmd[0], handbrakeCmd[1:]...)
-	err := cmd.Run()
-	if err != nil {
-		fmt.Printf("Error converting %s: %v\n", inputFile, err)
-		return
-	}
-	fmt.Printf("Conversion completed: %s\n", outputFile)
-}
-
-func processDirectory() error {
-	err := filepath.WalkDir(inputDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !d.IsDir() && filepath.Ext(path) == ".mp4" {
-			convertVideo(path, outputDir, presetFile)
-		}
-		return nil
-	})
-
-	return err
-}
 
 func main() {
+	inputDir := flag.String("input", "", "Diretório de entrada contendo arquivos .mp4")
+	outputDir := flag.String("output", "", "Diretório de saída para os arquivos convertidos")
 	flag.Parse()
 
-	if presetFile == "" {
-		fmt.Println("Error: No preset file specified. Use the -preset flag to specify a JSON preset file.")
-		os.Exit(1)
+	if *inputDir == "" || *outputDir == "" {
+		fmt.Println("Uso: go run main.go -input <diretório de entrada> -output <diretório de saída>")
+		return
 	}
 
-	if err := processDirectory(); err != nil {
-		fmt.Printf("Error processing directory: %v\n", err)
-	} else {
-		fmt.Println("All conversions completed.")
+	if _, err := os.Stat(*outputDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(*outputDir, os.ModePerm); err != nil {
+			fmt.Printf("Erro ao criar diretório de saída: %v\n", err)
+			return
+		}
 	}
+
+	files, err := filepath.Glob(filepath.Join(*inputDir, "*.mp4"))
+	if err != nil {
+		fmt.Printf("Erro ao listar arquivos .mp4: %v\n", err)
+		return
+	}
+
+	totalFiles := len(files)
+	if totalFiles == 0 {
+		fmt.Println("Nenhum arquivo .mp4 encontrado no diretório de entrada.")
+		return
+	}
+
+	startTotal := time.Now()
+
+	var wg sync.WaitGroup
+	// Define o número máximo de goroutines simultâneas
+	maxWorkers := 4 
+	sem := make(chan struct{}, maxWorkers)
+
+	for _, inputFile := range files {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(inputFile string) {
+			defer wg.Done()
+			// Libera o worker
+			defer func() { <-sem }() 
+
+			outputFile := filepath.Join(*outputDir, filepath.Base(inputFile))
+			outputFile = strings.Replace(outputFile, ".mp4", "_converted.mp4", 1)
+
+			start := time.Now()
+			fmt.Printf("Iniciando conversão de %s em %s\n", inputFile, start.Format("15:04:05"))
+
+			cmd := exec.Command("ffmpeg", "-i", inputFile, "-c:v", "libx264", "-movflags", "faststart", "-crf", "30", "-preset", "superfast", outputFile)
+			cmd.Stderr = nil
+			cmd.Stdout = nil
+
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("Erro ao converter %s: %v\n", inputFile, err)
+			} else {
+				duration := time.Since(start)
+				fmt.Printf("Conversão de %s concluída em %s. Tempo decorrido: %v\n", inputFile, time.Now().Format("15:04:05"), duration)
+			}
+		}(inputFile)
+	}
+
+	wg.Wait() 
+	totalDuration := time.Since(startTotal)
+	fmt.Printf("\nTodas as conversões foram concluídas. Tempo total: %v\n", totalDuration)
 }
