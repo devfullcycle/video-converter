@@ -21,7 +21,6 @@ func main() {
 		return
 	}
 
-	// Define o nome da pasta de saída
 	inputBase := filepath.Base(*inputDir)
 	outputBase := filepath.Join(*outputDir, inputBase+"_CONV")
 
@@ -32,10 +31,8 @@ func main() {
 		}
 	}
 
-	// Lista de arquivos encontrados
 	var files []string
 
-	// Espelhar a estrutura de diretórios
 	err := filepath.Walk(*inputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -89,7 +86,6 @@ func main() {
 			outputFile := filepath.Join(outputBase, relativePath)
 			outputDirPath := filepath.Dir(outputFile)
 
-			// Cria os diretórios necessários no diretório de saída
 			if err := os.MkdirAll(outputDirPath, os.ModePerm); err != nil {
 				fmt.Printf("Erro ao criar diretórios de saída: %v\n", err)
 				return
