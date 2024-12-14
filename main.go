@@ -12,24 +12,52 @@ import (
 
 func main() {
 	inputDir := flag.String("input", "", "Diretório de entrada contendo arquivos .mp4")
-	outputDir := flag.String("output", "", "Diretório de saída para os arquivos convertidos")
+	outputDir := flag.String("output", "", "Diretório base onde será criada a pasta de saída com o sufixo '_CONV'")
+	numWorkers := flag.Int("workers", 4, "Número de workers (threads) para processamento paralelo")
 	flag.Parse()
 
 	if *inputDir == "" || *outputDir == "" {
-		fmt.Println("Uso: go run main.go -input <diretório de entrada> -output <diretório de saída>")
+		fmt.Println("Uso: go run main.go -input <diretório de entrada> -output <diretório de saída> [-workers <número de workers>]")
 		return
 	}
 
-	if _, err := os.Stat(*outputDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(*outputDir, os.ModePerm); err != nil {
+	// Define o nome da pasta de saída
+	inputBase := filepath.Base(*inputDir)
+	outputBase := filepath.Join(*outputDir, inputBase+"_CONV")
+
+	if _, err := os.Stat(outputBase); os.IsNotExist(err) {
+		if err := os.MkdirAll(outputBase, os.ModePerm); err != nil {
 			fmt.Printf("Erro ao criar diretório de saída: %v\n", err)
 			return
 		}
 	}
 
-	files, err := filepath.Glob(filepath.Join(*inputDir, "*.mp4"))
+	// Lista de arquivos encontrados
+	var files []string
+
+	// Espelhar a estrutura de diretórios
+	err := filepath.Walk(*inputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relativePath, err := filepath.Rel(*inputDir, path)
+		if err != nil {
+			return err
+		}
+
+		outputPath := filepath.Join(outputBase, relativePath)
+		if info.IsDir() {
+			if err := os.MkdirAll(outputPath, os.ModePerm); err != nil {
+				return fmt.Errorf("erro ao criar diretório %s: %v", outputPath, err)
+			}
+		} else if filepath.Ext(path) == ".mp4" {
+			files = append(files, path)
+		}
+		return nil
+	})
+
 	if err != nil {
-		fmt.Printf("Erro ao listar arquivos .mp4: %v\n", err)
+		fmt.Printf("Erro ao espelhar estrutura de diretórios: %v\n", err)
 		return
 	}
 
@@ -42,9 +70,7 @@ func main() {
 	startTotal := time.Now()
 
 	var wg sync.WaitGroup
-	// Define o número máximo de goroutines simultâneas
-	maxWorkers := 4 
-	sem := make(chan struct{}, maxWorkers)
+	sem := make(chan struct{}, *numWorkers) // Número máximo de goroutines simultâneas
 
 	for _, inputFile := range files {
 		wg.Add(1)
@@ -52,11 +78,22 @@ func main() {
 
 		go func(inputFile string) {
 			defer wg.Done()
-			// Libera o worker
-			defer func() { <-sem }() 
+			defer func() { <-sem }() // Libera o worker
 
-			outputFile := filepath.Join(*outputDir, filepath.Base(inputFile))
-			// outputFile = strings.Replace(outputFile, ".mp4", "_converted.mp4", 1)
+			relativePath, err := filepath.Rel(*inputDir, inputFile)
+			if err != nil {
+				fmt.Printf("Erro ao obter caminho relativo: %v\n", err)
+				return
+			}
+
+			outputFile := filepath.Join(outputBase, relativePath)
+			outputDirPath := filepath.Dir(outputFile)
+
+			// Cria os diretórios necessários no diretório de saída
+			if err := os.MkdirAll(outputDirPath, os.ModePerm); err != nil {
+				fmt.Printf("Erro ao criar diretórios de saída: %v\n", err)
+				return
+			}
 
 			start := time.Now()
 			fmt.Printf("Iniciando conversão de %s em %s\n", inputFile, start.Format("15:04:05"))
@@ -74,7 +111,7 @@ func main() {
 		}(inputFile)
 	}
 
-	wg.Wait() 
+	wg.Wait()
 	totalDuration := time.Since(startTotal)
 	fmt.Printf("\nTodas as conversões foram concluídas. Tempo total: %v\n", totalDuration)
 }
