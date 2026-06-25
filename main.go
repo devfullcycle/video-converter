@@ -1,113 +1,167 @@
+// Command video-converter batch-converts videos with ffmpeg, automatically
+// choosing the best available hardware encoder (NVENC/QSV/AMF/VAAPI/
+// VideoToolbox) or CPU, configurable via flags or a .env file.
 package main
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"sync"
+	"runtime"
+	"syscall"
 	"time"
+
+	"github.com/devfullcycle/video-converter/internal/config"
+	"github.com/devfullcycle/video-converter/internal/convert"
+	"github.com/devfullcycle/video-converter/internal/discover"
+	"github.com/devfullcycle/video-converter/internal/encoder"
+	"github.com/devfullcycle/video-converter/internal/report"
 )
 
 func main() {
-	inputDir := flag.String("input", "", "Diretório de entrada contendo arquivos .mp4")
-	outputDir := flag.String("output", "", "Diretório base onde será criada a pasta de saída com o sufixo '_CONV'")
-	numWorkers := flag.Int("workers", 4, "Número de workers (threads) para processamento paralelo")
-	flag.Parse()
+	os.Exit(run())
+}
 
-	if *inputDir == "" || *outputDir == "" {
-		fmt.Println("Uso: go run main.go -input <diretório de entrada> -output <diretório de saída> [-workers <número de workers>]")
-		return
+func run() int {
+	cfg, err := config.Load(".env", os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "erro de configuração:", err)
+		return 2
 	}
 
-	inputBase := filepath.Base(*inputDir)
-	outputBase := filepath.Join(*outputDir, inputBase+"_CONV")
+	// Graceful shutdown: Ctrl-C cancels the context, which kills in-flight
+	// ffmpeg processes and lets partial files be cleaned up.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	if _, err := os.Stat(outputBase); os.IsNotExist(err) {
-		if err := os.MkdirAll(outputBase, os.ModePerm); err != nil {
-			fmt.Printf("Erro ao criar diretório de saída: %v\n", err)
-			return
-		}
+	env, err := encoder.DetectEnvironment(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "erro:", err)
+		return 2
 	}
 
-	var files []string
+	sel, err := encoder.Select(ctx, env, cfg.Backend, cfg.Codec, cfg.FallbackOnFailure, cfg.VAAPIDevice)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "nenhum encoder utilizável:", err)
+		return 2
+	}
 
-	err := filepath.Walk(*inputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		relativePath, err := filepath.Rel(*inputDir, path)
-		if err != nil {
-			return err
-		}
+	files, err := discover.Find(cfg.InputDir, cfg.OutputDir, cfg.Extensions)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "erro ao varrer entrada:", err)
+		return 2
+	}
+	if len(files) == 0 {
+		fmt.Printf("Nenhum arquivo (%v) encontrado em %s\n", cfg.Extensions, cfg.InputDir)
+		return 0
+	}
 
-		outputPath := filepath.Join(outputBase, relativePath)
-		if info.IsDir() {
-			if err := os.MkdirAll(outputPath, os.ModePerm); err != nil {
-				return fmt.Errorf("erro ao criar diretório %s: %v", outputPath, err)
-			}
-		} else if filepath.Ext(path) == ".mp4" {
-			files = append(files, path)
-		}
-		return nil
+	outputBase := filepath.Join(cfg.OutputDir, filepath.Base(filepath.Clean(cfg.InputDir))+"_CONV")
+	jobs := convert.PlanJobs(files, outputBase, cfg.Codec)
+
+	workers := cfg.Workers
+	if workers == 0 {
+		workers = defaultWorkers(sel.Backend, cfg.Intensity)
+	}
+	threads := cfg.Threads
+	if threads == 0 && sel.Backend == encoder.BackendCPU {
+		threads = defaultThreads(workers)
+	}
+	logDir := cfg.LogDir
+	if logDir == "" {
+		logDir = "logs"
+	}
+
+	printHeader(cfg, sel, len(jobs), workers)
+
+	start := time.Now()
+	results, _ := convert.Run(ctx, jobs, convert.Options{
+		FFmpeg:      env.FFmpegPath,
+		Backend:     sel.Backend,
+		Codec:       cfg.Codec,
+		Quality:     cfg.Quality,
+		FPS:         cfg.FPS,
+		MaxHeight:   cfg.MaxHeight,
+		Intensity:   cfg.Intensity,
+		Threads:     threads,
+		VAAPIDevice: cfg.VAAPIDevice,
+		Workers:     workers,
+		Overwrite:   cfg.Overwrite,
+		Nice:        cfg.Nice,
+		LogDir:      logDir,
 	})
 
-	if err != nil {
-		fmt.Printf("Erro ao espelhar estrutura de diretórios: %v\n", err)
-		return
+	summary := report.Summarize(results, time.Since(start))
+	report.Print(os.Stdout, summary)
+
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "\ninterrompido pelo usuário.")
+		return 130
 	}
-
-	totalFiles := len(files)
-	if totalFiles == 0 {
-		fmt.Println("Nenhum arquivo .mp4 encontrado no diretório de entrada.")
-		return
+	if summary.HasFailures() {
+		fmt.Fprintf(os.Stderr, "logs de erro em: %s\n", logDir)
+		return 1
 	}
+	return 0
+}
 
-	startTotal := time.Now()
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, *numWorkers) // Número máximo de goroutines simultâneas
-
-	for _, inputFile := range files {
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func(inputFile string) {
-			defer wg.Done()
-			defer func() { <-sem }() // Libera o worker
-
-			relativePath, err := filepath.Rel(*inputDir, inputFile)
-			if err != nil {
-				fmt.Printf("Erro ao obter caminho relativo: %v\n", err)
-				return
-			}
-
-			outputFile := filepath.Join(outputBase, relativePath)
-			outputDirPath := filepath.Dir(outputFile)
-
-			if err := os.MkdirAll(outputDirPath, os.ModePerm); err != nil {
-				fmt.Printf("Erro ao criar diretórios de saída: %v\n", err)
-				return
-			}
-
-			start := time.Now()
-			fmt.Printf("Iniciando conversão de %s em %s\n", inputFile, start.Format("15:04:05"))
-
-			cmd := exec.Command("ffmpeg", "-i", inputFile, "-c:v", "libx264", "-movflags", "faststart", "-crf", "30", "-preset", "superfast", outputFile)
-			cmd.Stderr = nil
-			cmd.Stdout = nil
-
-			if err := cmd.Run(); err != nil {
-				fmt.Printf("Erro ao converter %s: %v\n", inputFile, err)
-			} else {
-				duration := time.Since(start)
-				fmt.Printf("Conversão de %s concluída em %s. Tempo decorrido: %v\n", inputFile, time.Now().Format("15:04:05"), duration)
-			}
-		}(inputFile)
+func printHeader(cfg *config.Config, sel *encoder.Selection, nJobs, workers int) {
+	fmt.Println("Detecção de encoder:")
+	for _, line := range sel.Trace {
+		fmt.Printf("  - %s\n", line)
 	}
+	fmt.Printf("\nBackend: %s (%s)  |  Codec: %s  |  Qualidade: %d  |  Intensidade: %s  |  Workers: %d\n",
+		sel.Backend, sel.EncoderID, cfg.Codec, cfg.Quality, cfg.Intensity, workers)
+	fmt.Printf("Frame rate: %s  |  Escala: %s  |  Áudio: copiado (sem reencode)\n",
+		fpsLabel(cfg.FPS), scaleLabel(cfg.MaxHeight))
+	fmt.Printf("Convertendo %d arquivo(s) de %s\n\n", nJobs, cfg.InputDir)
+}
 
-	wg.Wait()
-	totalDuration := time.Since(startTotal)
-	fmt.Printf("\nTodas as conversões foram concluídas. Tempo total: %v\n", totalDuration)
+// fpsLabel renders the frame-rate setting for the header (0 = unchanged).
+func fpsLabel(fps int) string {
+	if fps <= 0 {
+		return "original"
+	}
+	return fmt.Sprintf("%d fps", fps)
+}
+
+// scaleLabel renders the scaling setting for the header (0 = unchanged).
+func scaleLabel(h int) string {
+	if h <= 0 {
+		return "original"
+	}
+	return fmt.Sprintf("até %dp", h)
+}
+
+// defaultWorkers picks a sensible concurrency per backend. Hardware encoders
+// share a single engine, so more workers don't help (and can hit session
+// limits); CPU scales with cores, scaled by the intensity knob.
+func defaultWorkers(b encoder.Backend, intensity encoder.Intensity) int {
+	switch b {
+	case encoder.BackendCPU:
+		n := runtime.NumCPU()
+		switch intensity {
+		case encoder.IntensityLight:
+			return 1
+		case encoder.IntensityMax:
+			return max(1, n-1)
+		default:
+			return max(1, n/2)
+		}
+	case encoder.BackendVAAPI:
+		return 1
+	default: // nvenc, qsv, amf, videotoolbox
+		return 2
+	}
+}
+
+// defaultThreads caps ffmpeg's CPU threads so workers*threads stays near the
+// core count and the machine remains usable.
+func defaultThreads(workers int) int {
+	if workers <= 0 {
+		return 0
+	}
+	return max(1, runtime.NumCPU()/workers)
 }
