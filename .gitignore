@@ -26,5 +26,6 @@ go.work.sum
 
 in/*
 out/*
+logs/
 video-converter
 .DS_Store
